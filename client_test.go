@@ -15,8 +15,13 @@ import (
 // (generated from models.NpcConfigData). Pinning the real payload here
 // catches a rename on either side of the wire: the two services are
 // separate Go modules with hand-mirrored structs, so nothing else would.
-const goNpcConfigFrame = `{"eventName":"npcConfig","settings":{"enemyShips":3,"enemyShipLife":35,` +
-	`"enemyShipSpeed":42,"enemyShipFireRateMs":800,"maxBlackHoles":4,"blackHoleSpawnPeriodSec":15}}`
+const goNpcConfigFrame = `{"eventName":"npcConfig","settings":{"enemyShipController":"both",` +
+	`"enemyShips":3,"aiShips":4,"shipLife":35,"enemyShipSpeed":42,"enemyShipFireRateMs":800,` +
+	`"maxBlackHoles":4,"blackHoleSpawnPeriodSec":15,"blackHoleDurationSec":90,` +
+	`"contactDamage":true,"killScaling":true,` +
+	`"shipSize":250,` +
+	`"npcAttacksPlayers":true,"npcAttacksNpc":false,` +
+	`"npcAttacksAi":true,"aiAttacksPlayers":true,"aiAttacksNpc":false,"aiAttacksAi":false}}`
 
 // TestAppliesNpcConfigFromShipsGo runs the whole path an admin's save takes
 // on this side: a websocket frame from ships-go, decoded by npcClient and
@@ -62,8 +67,16 @@ func TestAppliesNpcConfigFromShipsGo(t *testing.T) {
 
 	got := sim.currentSettings()
 	want := npcSettings{
-		EnemyShips: 3, EnemyShipLife: 35, EnemyShipSpeed: 42,
+		EnemyShipController: controllerBoth,
+		EnemyShips:          3,
+		AiShips:             4,
+		ShipLife:            35, EnemyShipSpeed: 42,
 		EnemyShipFireRateMs: 800, MaxBlackHoles: 4, BlackHoleSpawnPeriodSec: 15,
+		BlackHoleDurationSec: 90,
+		ContactDamage:        true,
+		KillScaling:          true,
+		ShipSize:             250,
+		NpcAttacksPlayers:    true, NpcAttacksAi: true, AiAttacksPlayers: true,
 	}
 	if got != want {
 		t.Fatalf("settings from ships-go not applied:\n got %+v\nwant %+v", got, want)

@@ -84,6 +84,11 @@ type gameBroadcast struct {
 	Players         map[string]PlayerData `json:"players"`
 	ActivePlayerIds []string              `json:"activePlayerIds"`
 	Kills           []killEventData       `json:"kills"`
+	// NewBullets is every shot fired this tick by everybody, relayed by
+	// ships-go exactly as it is to the browsers. Tracked here only so a
+	// ship can get out of the way of one; hits against our ships are still
+	// reported by the shooter's own client as an npcHit.
+	NewBullets []newBulletMsg `json:"newBullets"`
 }
 
 // killEventData is the part of ships-go's relayed playerDied events this

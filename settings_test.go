@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"sort"
 	"testing"
 	"time"
 )
@@ -137,7 +138,7 @@ func TestFireRateIsRespectedPerShip(t *testing.T) {
 func TestSettingsAreClamped(t *testing.T) {
 	bad := npcSettings{
 		EnemyShips:              -5,
-		EnemyShipLife:           0,
+		ShipLife:                0,
 		EnemyShipSpeed:          9999,
 		EnemyShipFireRateMs:     0,
 		MaxBlackHoles:           -1,
@@ -151,8 +152,8 @@ func TestSettingsAreClamped(t *testing.T) {
 	if got.EnemyShipSpeed != clientSpeedMax {
 		t.Fatalf("speed should clamp to a player's top speed, got %v", got.EnemyShipSpeed)
 	}
-	if got.EnemyShipLife != defaultNpcSettings().EnemyShipLife {
-		t.Fatalf("zero life should fall back to the default, got %v", got.EnemyShipLife)
+	if got.ShipLife != defaultNpcSettings().ShipLife {
+		t.Fatalf("zero life should fall back to the default, got %v", got.ShipLife)
 	}
 	// A zero fire rate would fire every tick and a zero spawn period would
 	// spawn a black hole every tick, so neither may survive sanitizing.
@@ -179,7 +180,6 @@ func TestBlackHoleCapIsHonoured(t *testing.T) {
 	settings.BlackHoleSpawnPeriodSec = 1
 	s := settingsSim(f, settings)
 
-	// Black holes only spawn with more than one player present.
 	players := map[string]PlayerData{
 		"p1": {SocketId: "p1", ShipId: "s1"},
 		"p2": {SocketId: "p2", ShipId: "s1", X: 500},
@@ -271,7 +271,7 @@ func TestAKilledShipComesBackWithItsIdentityAndScore(t *testing.T) {
 	f := &fakeSender{}
 	s := newSim(f)
 	s.settings.EnemyShips = 1
-	s.settings.EnemyShipLife = 20
+	s.settings.ShipLife = 20
 
 	original := theShip(s)
 	original.Kills = 3
@@ -284,7 +284,9 @@ func TestAKilledShipComesBackWithItsIdentityAndScore(t *testing.T) {
 
 	players := map[string]PlayerData{"player1": {SocketId: "player1", ShipId: "s1"}}
 	// Respawn is delayed by a death, so fast-forward past it.
-	s.enemyRespawnAt = time.Now().Add(-time.Second)
+	for _, retired := range s.retiredShips[controllerRule] {
+		retired.respawnAt = time.Now().Add(-time.Second)
+	}
 	s.manageFleetSize(players, time.Now())
 
 	revived := theShip(s)
@@ -364,35 +366,325 @@ func TestShrinkingTheFleetKeepsTheRetiredShipsScores(t *testing.T) {
 // The toggle is pushed from ships-go as an npcConfig and must survive
 // sanitized(), which is the only thing standing between the wire and the
 // simulation. Clamping other fields must never quietly reset it.
-func TestFightEachOtherSurvivesSanitized(t *testing.T) {
+func TestAttackMatrixSurvivesSanitized(t *testing.T) {
 	for _, want := range []bool{true, false} {
 		// Deliberately out-of-range everywhere else, so sanitized() has
 		// plenty to rewrite while it is at it.
 		in := npcSettings{
-			EnemyShips:               9999,
-			EnemyShipLife:            -1,
-			EnemyShipSpeed:           0,
-			EnemyShipFireRateMs:      0,
-			MaxBlackHoles:            -5,
-			BlackHoleSpawnPeriodSec:  0,
-			EnemyShipsFightEachOther: want,
+			EnemyShips:              9999,
+			ShipLife:                -1,
+			EnemyShipSpeed:          0,
+			EnemyShipFireRateMs:     0,
+			MaxBlackHoles:           -5,
+			BlackHoleSpawnPeriodSec: 0,
+			NpcAttacksNpc:           want,
+			AiAttacksPlayers:        want,
 		}
-		if got := in.sanitized().EnemyShipsFightEachOther; got != want {
-			t.Fatalf("sanitized() changed the toggle: got %v want %v", got, want)
+		got := in.sanitized()
+		if got.NpcAttacksNpc != want || got.AiAttacksPlayers != want {
+			t.Fatalf("sanitized() changed the attack matrix: got %+v want %v", got, want)
 		}
 	}
 }
 
-// ships-go sends the whole struct; decoding it here must set the toggle.
-func TestFightEachOtherDecodesFromNpcConfig(t *testing.T) {
+// ships-go sends the whole struct; decoding it here must set every cell of
+// the attack matrix, and the controller choice with it.
+func TestAttackMatrixDecodesFromNpcConfig(t *testing.T) {
 	var msg struct {
 		Settings npcSettings `json:"settings"`
 	}
-	raw := `{"eventName":"npcConfig","settings":{"enemyShips":2,"enemyShipsFightEachOther":true}}`
+	raw := `{"eventName":"npcConfig","settings":{"enemyShipController":"both","enemyShips":2,` +
+		`"aiShips":3,"npcAttacksPlayers":true,"npcAttacksNpc":true,"npcAttacksAi":true,` +
+		`"aiAttacksPlayers":true,"aiAttacksNpc":true,"aiAttacksAi":true}}`
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
 	}
-	if !msg.Settings.EnemyShipsFightEachOther {
-		t.Fatal("expected the toggle to decode as on")
+	got := msg.Settings
+	if got.EnemyShipController != controllerBoth || got.AiShips != 3 {
+		t.Fatalf("controller/counts did not decode: %+v", got)
+	}
+	if !got.NpcAttacksPlayers || !got.NpcAttacksNpc || !got.NpcAttacksAi ||
+		!got.AiAttacksPlayers || !got.AiAttacksNpc || !got.AiAttacksAi {
+		t.Fatalf("expected every cell of the matrix to decode as on: %+v", got)
+	}
+}
+
+// Every ship is normalised to the standard size, exactly as ships-vue's
+// Player.calculateScale does it, so a ship drawn on a big canvas is not
+// flown as if it were bigger than a player can see it. The scale is the
+// collision box, so this is a gameplay rule and not a cosmetic one.
+func TestShipsAreScaledToTheStandardSize(t *testing.T) {
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShips = 3
+	// The test ship is 100x200, so its largest side is 200.
+	s := settingsSim(f, settings)
+	s.manageFleet(controllerRule, somePlayers(), time.Now())
+
+	if len(s.enemyShips) == 0 {
+		t.Fatal("no ships spawned")
+	}
+	for _, enemyShip := range s.enemyShips {
+		if want := 100.0 / 200.0; enemyShip.Scale != want {
+			t.Fatalf("ship scale: got %v want %v", enemyShip.Scale, want)
+		}
+		// Radius follows from the scale, and is what ramming, crowding and
+		// target size are all measured with.
+		if want := math.Hypot(50*0.5, 100*0.5); enemyShip.radius() != want {
+			t.Fatalf("ship radius: got %v want %v", enemyShip.radius(), want)
+		}
+	}
+}
+
+// Changing the size from the admin panel has to reach the ships already
+// flying, or the fleet on the map keeps its old geometry while
+// reinforcements arrive with the new one.
+func TestShipSizeChangeRescalesTheExistingFleet(t *testing.T) {
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShips = 2
+	s := settingsSim(f, settings)
+	s.manageFleet(controllerRule, somePlayers(), time.Now())
+
+	settings.ShipSize = 400
+	s.applySettings(settings)
+
+	if len(s.enemyShips) == 0 {
+		t.Fatal("no ships spawned")
+	}
+	for _, enemyShip := range s.enemyShips {
+		if want := 400.0 / 200.0; enemyShip.Scale != want {
+			t.Fatalf("existing ship not rescaled: got %v want %v", enemyShip.Scale, want)
+		}
+	}
+}
+
+func TestShipSizeDefaultsAndClamps(t *testing.T) {
+	if got := defaultNpcSettings().ShipSize; got != defaultShipSize {
+		t.Fatalf("default ship size: got %d want %d", got, defaultShipSize)
+	}
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		// Unset (an older ships-go) must mean the default, not the
+		// minimum: clamping up from zero would shrink every ship.
+		{"unset", 0, defaultShipSize},
+		{"negative", -50, defaultShipSize},
+		{"too small", 1, minShipSize},
+		{"too big", 99999, maxShipSize},
+		{"kept", 250, 250},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			settings := defaultNpcSettings()
+			settings.ShipSize = c.in
+			if got := settings.sanitized().ShipSize; got != c.want {
+				t.Fatalf("got %d want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// A black hole's life is read from the settings every tick rather than
+// stamped on it at spawn, so shortening it from the admin panel retires the
+// ones already on the map instead of only applying to the next one.
+func TestBlackHoleDurationAppliesToExistingBlackHoles(t *testing.T) {
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShipController = controllerNone
+	s := settingsSim(f, settings)
+
+	addBH(s, 0, 0)
+	bh := s.npcs["bh"]
+	bh.Scale = 1
+	bh.spawnedAt = time.Now().Add(-100 * time.Second)
+
+	// 100s into a 180s life: still fully grown.
+	s.tick(nil)
+	if s.npcs["bh"] == nil {
+		t.Fatal("black hole retired while still within its duration")
+	}
+	if s.npcs["bh"].Scale != 1 {
+		t.Fatalf("black hole shrinking early: scale %v", s.npcs["bh"].Scale)
+	}
+
+	settings.BlackHoleDurationSec = 60 // deliberately shorter than the 100s it has lived
+	s.applySettings(settings)
+
+	// Now past its (shortened) life, it must shrink away and vanish.
+	for i := 0; i < 200 && s.npcs["bh"] != nil; i++ {
+		s.tick(nil)
+	}
+	if s.npcs["bh"] != nil {
+		t.Fatalf("black hole outlived a shortened duration: scale %v", s.npcs["bh"].Scale)
+	}
+}
+
+func TestBlackHoleDurationDefaultsAndClamps(t *testing.T) {
+	if got := defaultNpcSettings().BlackHoleDurationSec; got != defaultBlackHoleDurationSec {
+		t.Fatalf("default duration: got %d want %d", got, defaultBlackHoleDurationSec)
+	}
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"unset", 0, defaultBlackHoleDurationSec},
+		{"negative", -1, defaultBlackHoleDurationSec},
+		{"too short", 1, minBlackHoleDurationSec},
+		{"too long", 999999, maxBlackHoleDurationSec},
+		{"kept", 45, 45},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			settings := defaultNpcSettings()
+			settings.BlackHoleDurationSec = c.in
+			if got := settings.sanitized().BlackHoleDurationSec; got != c.want {
+				t.Fatalf("got %d want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// The duration a new black hole reports to the clients is the configured
+// one, not the constant it used to be.
+func TestSpawnedBlackHoleCarriesTheConfiguredDuration(t *testing.T) {
+	bh := spawnBlackHole(somePlayers(), time.Now(), 45*time.Second)
+	if bh.Duration != 45000 {
+		t.Fatalf("duration on the wire: got %d want %d", bh.Duration, 45000)
+	}
+}
+
+// Black holes used to need two players before one would spawn, so anybody
+// playing alone - which is how the fleet settings get tested - never saw a
+// single one. Enemy ships have always spawned for a lone player, and a
+// black hole is a hazard for them too.
+func TestBlackHolesSpawnForASinglePlayer(t *testing.T) {
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShipController = controllerNone
+	settings.BlackHoleSpawnPeriodSec = 1
+	s := settingsSim(f, settings)
+
+	players := map[string]PlayerData{"p1": {SocketId: "p1", ShipId: "s1"}}
+	s.lastSpawn = time.Time{}
+	s.tick(players)
+
+	if len(s.npcs) != 1 {
+		t.Fatalf("a lone player got %d black holes, want 1", len(s.npcs))
+	}
+}
+
+// The size used to be stepped up once per tick, so how fast a black hole
+// opened depended on the tick rate and had nothing to do with its
+// duration: at a 100ms tick it needed 10s to open at all, which a 15s
+// black hole spent almost its whole life doing. It is now derived from
+// elapsed time, and collapses so that it is gone exactly on time.
+func TestBlackHoleOpensAndClosesWithinItsDuration(t *testing.T) {
+	const duration = 15 * time.Second
+
+	full := blackHoleScaleAt(duration/2, duration)
+	if full != 1.0 {
+		t.Fatalf("mid-life scale: got %v want 1", full)
+	}
+	if got := blackHoleScaleAt(blackHoleGrowthTime, duration); got != 1.0 {
+		t.Fatalf("scale once grown: got %v want 1", got)
+	}
+	if got := blackHoleScaleAt(0, duration); got != blackHoleScaleStep {
+		t.Fatalf("scale at spawn: got %v want %v", got, blackHoleScaleStep)
+	}
+	if got := blackHoleScaleAt(duration, duration); got != blackHoleScaleStep {
+		t.Fatalf("scale at the end: got %v want %v", got, blackHoleScaleStep)
+	}
+
+	// A very short one still opens rather than staying a dot.
+	if got := blackHoleScaleAt(3*time.Second, 6*time.Second); got != 1.0 {
+		t.Fatalf("short black hole never opened: got %v", got)
+	}
+
+	// And it is retired when its duration is up, not after an extra
+	// tick-counted collapse on top of it.
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShipController = controllerNone
+	settings.BlackHoleDurationSec = 15
+	settings.BlackHoleSpawnPeriodSec = 3600
+	s := settingsSim(f, settings)
+
+	addBH(s, 0, 0)
+	s.npcs["bh"].spawnedAt = time.Now().Add(-14 * time.Second)
+	s.tick(nil)
+	if s.npcs["bh"] == nil {
+		t.Fatal("black hole retired before its duration was up")
+	}
+	s.npcs["bh"].spawnedAt = time.Now().Add(-15 * time.Second)
+	s.tick(nil)
+	if s.npcs["bh"] != nil {
+		t.Fatal("black hole outlived its duration")
+	}
+}
+
+// A destroyed fleet used to come back in a single tick: one shared timer
+// was pushed forward by every death, and when it finally expired
+// manageFleet filled every empty place at once. Each ship now serves its
+// own delay, so they trickle back the way players do.
+func TestDeadShipsRespawnOneByOneRatherThanAllAtOnce(t *testing.T) {
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShips = 6
+	settings.AiShips = 0
+	settings.EnemyShipController = string(controllerRule)
+	s := settingsSim(f, settings)
+
+	players := map[string]PlayerData{"p1": {SocketId: "p1", ShipId: "s1"}}
+	s.tickEnemyShips(players, time.Now())
+	if len(s.enemyShips) != 6 {
+		t.Fatalf("fleet did not form: %d ships", len(s.enemyShips))
+	}
+
+	// Wipe it out on a single tick, the worst case for a shared timer.
+	for _, ship := range s.enemyShips {
+		s.handleNpcHit(npcHitMsg{NpcId: ship.Id, From: "p1", BulletCharge: 9999})
+	}
+	if len(s.enemyShips) != 0 {
+		t.Fatalf("fleet should be wiped out, %d left", len(s.enemyShips))
+	}
+
+	retired := s.retiredShips[controllerRule]
+	if len(retired) != 6 {
+		t.Fatalf("retired %d identities, want 6", len(retired))
+	}
+	// No two of them may be due back on the same tick.
+	sameTick := 0
+	for i, a := range retired {
+		for _, b := range retired[i+1:] {
+			if a.respawnAt.Sub(b.respawnAt).Abs() < 50*time.Millisecond {
+				sameTick++
+			}
+		}
+	}
+	if sameTick > 3 {
+		t.Fatalf("%d pairs of ships are due back on the same tick: the fleet still returns as a block", sameTick)
+	}
+
+	// Nobody comes back before their delay, and they arrive in the order
+	// they are due rather than in one burst.
+	now := time.Now()
+	s.tickEnemyShips(players, now.Add(enemyShipRespawnDelay-time.Second))
+	if len(s.enemyShips) != 0 {
+		t.Fatalf("%d ships respawned before their delay", len(s.enemyShips))
+	}
+
+	sort.Slice(retired, func(i, j int) bool { return retired[i].respawnAt.Before(retired[j].respawnAt) })
+	for i, ship := range retired {
+		s.tickEnemyShips(players, ship.respawnAt.Add(time.Millisecond))
+		if _, back := s.enemyShips[ship.Id]; !back {
+			t.Fatalf("ship %d was not back once its own delay had passed", i)
+		}
+		if len(s.enemyShips) != i+1 {
+			t.Fatalf("after %d delays elapsed, %d ships are back: they are not respawning one by one", i+1, len(s.enemyShips))
+		}
 	}
 }

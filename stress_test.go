@@ -13,7 +13,7 @@ func TestFleetFightingItselfStaysSane(t *testing.T) {
 	f := &fakeSender{}
 	settings := defaultNpcSettings()
 	settings.EnemyShips = 8
-	settings.EnemyShipsFightEachOther = true
+	settings.NpcAttacksNpc = true
 	settings.MaxBlackHoles = 0
 	s := settingsSim(f, settings)
 
@@ -56,8 +56,10 @@ func TestFleetFightingItselfStaysSane(t *testing.T) {
 	for _, ship := range s.enemyShips {
 		kills += ship.Kills
 	}
-	for _, ship := range s.retiredShips {
-		kills += ship.Kills
+	for _, fleet := range s.retiredShips {
+		for _, ship := range fleet {
+			kills += ship.Kills
+		}
 	}
 	if kills == 0 {
 		t.Fatal("no NPC was ever credited with a kill")
@@ -78,5 +80,131 @@ func TestFleetFightingItselfStaysSane(t *testing.T) {
 				t.Fatalf("ships %s and %s overlap by (%v, %v) while fighting", a.Id, b.Id, ox, oy)
 			}
 		}
+	}
+}
+
+// The admin panel allows 100 ships per fleet, so 200 is the worst case a
+// deployment can be asked for. This measures the real cost of a tick at
+// that size and fails if it stops fitting comfortably inside the tick
+// interval: the simulation is single-threaded, so a tick that overruns
+// makes every NPC on every screen stutter.
+func TestFullFleetsFitInsideATick(t *testing.T) {
+	if testing.Short() {
+		t.Skip("performance measurement")
+	}
+
+	const (
+		perFleet     = 100
+		ticks        = 600
+		tickInterval = 100 * time.Millisecond
+	)
+
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShipController = controllerBoth
+	settings.EnemyShips = perFleet
+	settings.AiShips = perFleet
+	settings.MaxBlackHoles = 10
+	// Everything hunting everything: the most expensive matrix there is,
+	// since every ship considers every other ship as a target and every
+	// bullet is tested against every ship.
+	settings.NpcAttacksPlayers = true
+	settings.NpcAttacksNpc = true
+	settings.NpcAttacksAi = true
+	settings.AiAttacksPlayers = true
+	settings.AiAttacksNpc = true
+	settings.AiAttacksAi = true
+	s := settingsSim(f, settings)
+	if s.policy == nil {
+		t.Fatal("no AI policy embedded; the AI fleet would fall back to the rule controller")
+	}
+
+	players := map[string]PlayerData{}
+	for i := 0; i < 4; i++ {
+		id := string(rune('a' + i))
+		players[id] = PlayerData{SocketId: id, ShipId: "s1", X: float32(i * 700), Y: float32(i * 500),
+			Width: 100, Height: 200, Scale: 1}
+	}
+
+	now := time.Now()
+	started := time.Now()
+	for i := 0; i < ticks; i++ {
+		now = now.Add(tickInterval)
+		s.mu.Lock()
+		s.tickEnemyShips(players, now)
+		s.advanceBullets(now)
+		s.mu.Unlock()
+	}
+	elapsed := time.Since(started)
+	perTick := elapsed / ticks
+
+	ruleShips, aiShips := s.fleetCount(controllerRule), s.fleetCount(controllerAi)
+	t.Logf("%d ships (%d rule / %d AI), %d bullets in flight: %v per tick (%.1f%% of a %v tick)",
+		len(s.enemyShips), ruleShips, aiShips, len(s.activeBullets),
+		perTick, 100*float64(perTick)/float64(tickInterval), tickInterval)
+
+	// Not exactly perFleet: a death arms a respawn delay, so at any instant
+	// a few slots are legitimately waiting to be refilled. What matters is
+	// that the fleets are being kept near strength rather than quietly
+	// dwindling, which is what would make the timing above meaningless.
+	if ruleShips < perFleet-5 || aiShips < perFleet-5 {
+		t.Fatalf("fleets dwindled: %d rule, %d AI, want about %d each", ruleShips, aiShips, perFleet)
+	}
+	if ruleShips > perFleet || aiShips > perFleet {
+		t.Fatalf("a fleet grew past its cap: %d rule, %d AI", ruleShips, aiShips)
+	}
+	if perTick > tickInterval/2 {
+		t.Fatalf("a tick costs %v, more than half the %v budget", perTick, tickInterval)
+	}
+}
+
+// With the two fleets set against each other on identical physics, both
+// have to be able to score: an AI fleet that never lands a shot would mean
+// the policy is not really flying, and the admin toggle would be a lie.
+func TestBothFleetsCanFight(t *testing.T) {
+	f := &fakeSender{}
+	settings := defaultNpcSettings()
+	settings.EnemyShipController = controllerBoth
+	settings.EnemyShips = 10
+	settings.AiShips = 10
+	settings.MaxBlackHoles = 0
+	settings.NpcAttacksPlayers = false
+	settings.AiAttacksPlayers = false
+	settings.NpcAttacksAi = true
+	settings.AiAttacksNpc = true
+	s := settingsSim(f, settings)
+	if s.policy == nil {
+		t.Skip("no AI policy embedded")
+	}
+
+	players := map[string]PlayerData{"p1": {SocketId: "p1", ShipId: "s1", X: 0, Y: 0,
+		Width: 100, Height: 200, Scale: 1}}
+
+	now := time.Now()
+	for i := 0; i < 4000; i++ {
+		now = now.Add(100 * time.Millisecond)
+		s.mu.Lock()
+		s.tickEnemyShips(players, now)
+		s.advanceBullets(now)
+		s.mu.Unlock()
+	}
+
+	kills := map[controllerKind]int{}
+	count := func(ship *enemyShipState) { kills[ship.controller] += ship.Kills }
+	for _, ship := range s.enemyShips {
+		count(ship)
+	}
+	for _, fleet := range s.retiredShips {
+		for _, ship := range fleet {
+			count(ship)
+		}
+	}
+
+	t.Logf("head to head: rule %d kills, AI %d kills", kills[controllerRule], kills[controllerAi])
+	if kills[controllerRule] == 0 {
+		t.Fatal("the rule fleet never scored")
+	}
+	if kills[controllerAi] == 0 {
+		t.Fatal("the AI fleet never scored: the policy is not really flying these ships")
 	}
 }

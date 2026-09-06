@@ -31,6 +31,9 @@ type npcClient struct {
 	// be credited for the players it shot down. The hit itself is always
 	// detected by the victim's client, never here.
 	onKills func([]killEventData)
+	// onBullets is called with every shot ships-go broadcasts, so the
+	// simulator can see incoming fire and fly out of its way.
+	onBullets func([]newBulletMsg)
 
 	mu   sync.Mutex
 	conn *websocket.Conn
@@ -130,6 +133,9 @@ func (c *npcClient) connectAndRead() error {
 			c.players.apply(msg)
 			if c.onKills != nil {
 				c.onKills(msg.Kills)
+			}
+			if c.onBullets != nil && len(msg.NewBullets) > 0 {
+				c.onBullets(msg.NewBullets)
 			}
 		case "npcConfig":
 			var cfg npcConfigMsg

@@ -19,7 +19,7 @@ func (f *fakeSender) sendPlayerDied(m playerDiedMsg) error { f.died = append(f.d
 func newSim(f *fakeSender) *npcSimulator {
 	ship := publicShip{Id: "s1", Name: "T", Width: 100, Height: 200}
 	s := newNpcSimulator(f, []publicShip{ship}, 100*time.Millisecond)
-	s.enemyShips["npc1"] = &enemyShipState{ship: ship, spawnedAt: time.Now(), NpcData: NpcData{
+	s.enemyShips["npc1"] = &enemyShipState{ship: ship, controller: controllerRule, spawnedAt: time.Now(), NpcData: NpcData{
 		Type: NpcTypes.Ship, Id: "npc1", ShipId: "s1", Scale: 1, Life: 20, MaxLife: 20,
 	}}
 	return s
@@ -80,8 +80,9 @@ func TestSwallowedDies(t *testing.T) {
 	if theShip(s) != nil {
 		t.Fatal("ship should be gone")
 	}
-	if !time.Now().Before(s.enemyRespawnAt) {
-		t.Fatal("respawn timer not set")
+	retired := s.retiredShips[controllerRule]
+	if len(retired) != 1 || !time.Now().Before(retired[0].respawnAt) {
+		t.Fatal("the dead ship's own respawn timer was not armed")
 	}
 }
 
@@ -206,7 +207,7 @@ func TestAimsAtTargetFromEveryDirection(t *testing.T) {
 
 	for deg := 0; deg < 360; deg += 45 {
 		f.bullets = nil
-		s.enemyShips["npc1"] = &enemyShipState{ship: ship, spawnedAt: time.Now(), NpcData: NpcData{
+		s.enemyShips["npc1"] = &enemyShipState{ship: ship, controller: controllerRule, spawnedAt: time.Now(), NpcData: NpcData{
 			Type: NpcTypes.Ship, Id: "npc1", ShipId: "s1", Scale: 1, Life: 20, MaxLife: 20,
 			X: -50, Y: -100, // center (0,0)
 		}}
@@ -324,16 +325,18 @@ func TestNpcUpdateAlwaysCarriesRotate(t *testing.T) {
 // addShip seeds a second enemy ship, for the NPC-vs-NPC tests.
 func addShip(s *npcSimulator, id string, x, y float64) *enemyShipState {
 	ship := s.shipsById["s1"]
-	e := &enemyShipState{ship: ship, spawnedAt: time.Now(), NpcData: NpcData{
+	e := &enemyShipState{ship: ship, controller: controllerRule, spawnedAt: time.Now(), NpcData: NpcData{
 		Type: NpcTypes.Ship, Id: id, ShipId: "s1", Name: id, X: x, Y: y, Scale: 1, Life: 20, MaxLife: 20,
 	}}
 	s.enemyShips[id] = e
 	return e
 }
 
+// withFriendlyFire points the whole rule fleet at itself, which is what
+// the old single "enemy ships attack each other" toggle used to mean.
 func withFriendlyFire(s *npcSimulator, on bool) {
 	settings := s.settings
-	settings.EnemyShipsFightEachOther = on
+	settings.NpcAttacksNpc = on
 	s.settings = settings
 }
 
@@ -468,7 +471,7 @@ func TestFastBulletsDoNotTunnelThroughShips(t *testing.T) {
 	s := newNpcSimulator(f, []publicShip{ship}, 500*time.Millisecond)
 	withFriendlyFire(s, true)
 
-	shooter := &enemyShipState{ship: ship, spawnedAt: time.Now(), NpcData: NpcData{
+	shooter := &enemyShipState{ship: ship, controller: controllerRule, spawnedAt: time.Now(), NpcData: NpcData{
 		Type: NpcTypes.Ship, Id: "npc1", ShipId: "s1", Scale: 1, Life: 20, MaxLife: 20,
 	}}
 	s.enemyShips["npc1"] = shooter
@@ -538,18 +541,29 @@ func TestAimsAtCenterOfAPlayerFlyingACustomShip(t *testing.T) {
 			players := map[string]PlayerData{"p1": {
 				SocketId: "p1", ShipId: "a-ship-of-their-own", X: float32(tc.px), Y: float32(tc.py),
 			}}
+			// The best aim of the whole run, not the aim at some fixed
+			// tick: a ship no longer parks in front of its target and holds
+			// an aim, it makes attack runs, so where it points at any given
+			// moment depends on where it is in that cycle. What matters is
+			// that its nose passes exactly through the player's center on
+			// the way past - that is when it shoots.
+			off := math.Pi
 			for i := 0; i < 900; i++ {
 				now = now.Add(100 * time.Millisecond)
 				s.tickEnemyShip(sh, players, now)
-			}
 
-			// newSim's only public ship is 100x200, so the fallback puts the
-			// player's center half a ship down and right of its anchor.
-			cx, cy := sh.center()
-			bearing := math.Atan2(tc.py+100-cy, tc.px+50-cx)
-			off := math.Abs(angleDifference(float64(sh.Rotate), bearing))
+				// newSim's only public ship is 100x200, so the fallback puts
+				// the player's center half a ship down and right of its
+				// anchor.
+				cx, cy := sh.center()
+				if math.Hypot(tc.px+50-cx, tc.py+100-cy) > enemyShipShootRange {
+					continue
+				}
+				bearing := math.Atan2(tc.py+100-cy, tc.px+50-cx)
+				off = math.Min(off, math.Abs(angleDifference(float64(sh.Rotate), bearing)))
+			}
 			if off > 0.02 {
-				t.Fatalf("settled %.1f degrees off the player's center", off*180/math.Pi)
+				t.Fatalf("closed on the player %.1f degrees off their center", off*180/math.Pi)
 			}
 		})
 	}
@@ -599,15 +613,21 @@ func TestAimsAtACustomShipUsingTheSizeOnTheWire(t *testing.T) {
 
 	now := time.Now()
 	players := map[string]PlayerData{"p1": p}
+	// As above: judged on the best aim of the attack run, since it no
+	// longer stops in front of the player and holds one.
+	off := math.Pi
 	for i := 0; i < 900; i++ {
 		now = now.Add(100 * time.Millisecond)
 		s.tickEnemyShip(sh, players, now)
-	}
 
-	sx, sy := sh.center()
-	off := math.Abs(angleDifference(float64(sh.Rotate), math.Atan2(6500-sy, 6500-sx)))
+		sx, sy := sh.center()
+		if math.Hypot(6500-sx, 6500-sy) > enemyShipShootRange {
+			continue
+		}
+		off = math.Min(off, math.Abs(angleDifference(float64(sh.Rotate), math.Atan2(6500-sy, 6500-sx))))
+	}
 	if off > 0.02 {
-		t.Fatalf("settled %.1f degrees off the player's center", off*180/math.Pi)
+		t.Fatalf("closed on the player %.1f degrees off their center", off*180/math.Pi)
 	}
 	if len(f.bullets) == 0 {
 		t.Fatal("never fired")
@@ -629,5 +649,85 @@ func TestFallsBackToTheShipListWhenSizeIsAbsent(t *testing.T) {
 	p := PlayerData{ShipId: "s1", X: 100, Y: 100} // newSim's only ship is 100x200
 	if cx, cy := s.playerCenter(p); cx != 150 || cy != 200 {
 		t.Fatalf("center (%v,%v), want (150,200)", cx, cy)
+	}
+}
+
+// A ship that cannot see incoming fire cannot avoid it, and one that never
+// avoids it is a target rather than an opponent. The control run is the
+// same fight with the ship kept ignorant of the bullet: it flies straight
+// into it, which is what every NPC used to do.
+func TestShipsFlyOutOfTheWayOfIncomingFire(t *testing.T) {
+	closestApproach := func(aware bool) float64 {
+		f := &fakeSender{}
+		s := newSim(f)
+		sh := theShip(s)
+		sh.X, sh.Y = 0, 0
+		sh.Rotate = float32(math.Pi) // already pointing at the player
+		sh.Speed = s.maxSpeed
+
+		players := map[string]PlayerData{"p1": {SocketId: "p1", ShipId: "s1", X: -8000, Y: 0}}
+
+		// Head-on, from the player's direction: dodging it means breaking
+		// off the attack, which is the interesting case. Straight down the
+		// ship's own axis, so only a sideways move can clear the corridor.
+		speed := (25 * 1.5) * s.frameScale
+		bulletX, bulletY := 2500.0, 0.0
+		stepX, stepY := -speed, 0.0
+
+		now := time.Now()
+		if aware {
+			s.incomingBullets["b1"] = &npcBullet{
+				ownerId: "p1", x: bulletX, y: bulletY, stepX: stepX, stepY: stepY, firedAt: now,
+			}
+		}
+
+		closest := math.MaxFloat64
+		for i := 0; i < 60; i++ {
+			now = now.Add(100 * time.Millisecond)
+			s.advanceIncomingBullets(now)
+			s.tickEnemyShip(sh, players, now)
+
+			bulletX += stepX
+			bulletY += stepY
+			cx, cy := sh.center()
+			closest = math.Min(closest, math.Hypot(bulletX-cx, bulletY-cy))
+		}
+		return closest
+	}
+
+	radius := math.Hypot(50, 100) // newSim's only ship is 100x200
+	if hit := closestApproach(false); hit > radius {
+		t.Fatalf("control: the bullet missed by %.0f without any dodging, so this proves nothing", hit)
+	}
+	if missed := closestApproach(true); missed <= radius {
+		t.Fatalf("the ship flew into a bullet it could see: closest approach %.0f, hull radius %.0f", missed, radius)
+	}
+}
+
+// Ships used to brake to a dead stop once inside their standoff distance
+// and shoot from there, which made them stationary targets - something no
+// player can be, since a player who stops is dead.
+func TestShipsKeepMovingWhileAttacking(t *testing.T) {
+	f := &fakeSender{}
+	s := newSim(f)
+	sh := theShip(s)
+	sh.X, sh.Y = 0, 0
+
+	players := map[string]PlayerData{"p1": {SocketId: "p1", ShipId: "s1", X: 1500, Y: 0}}
+
+	now := time.Now()
+	stalled, ticks := 0, 600
+	for i := 0; i < ticks; i++ {
+		now = now.Add(100 * time.Millisecond)
+		s.tickEnemyShip(sh, players, now)
+		if sh.Speed < s.maxSpeed*0.2 {
+			stalled++
+		}
+	}
+	if stalled > ticks/20 {
+		t.Fatalf("the ship was crawling or stopped on %d of %d ticks", stalled, ticks)
+	}
+	if len(f.bullets) == 0 {
+		t.Fatal("never fired: keeping moving cannot come at the cost of never attacking")
 	}
 }
