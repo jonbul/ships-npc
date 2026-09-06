@@ -29,6 +29,15 @@ endpoint as a websocket **client**, the same way a player's browser does.
    settings are saved, and one right after `npcAuth` succeeds, so a restart
    of either process converges on the same values.
 
+> **Only one ships-npc may run at a time.** Every `npcUpdate` replaces the
+> entire NPC snapshot, so two instances do not add up — they overwrite each
+> other every tick, and players see enemy ships flicker in and out of
+> existence: unnamed, undrawn and impossible to hit, while their bullets keep
+> arriving. ships-go therefore accepts only the first controller to
+> authenticate and answers any duplicate with an `npcRejected` event, which
+> this service logs. If you see that in the log, a previous `ships-npc` is
+> almost certainly still running.
+
 ## Admin settings
 
 The NPCs are tuned live from ships-vue's admin panel. The browser never
@@ -43,14 +52,15 @@ respawns.
 | Enemy ship life | Starting/maximum life of a *newly spawned* ship. Ships already in play keep the value they spawned with. |
 | Enemy ship speed | Cruising speed, in the game's **own speed units** (the same scale as ships-vue's `SPEED.MAX`). A player's top speed is `50`, so `50` means players can never outrun them. Default `20`. Escaping a black hole ignores this and always uses the full envelope, since being sucked in is fatal. |
 | Enemy ship fire rate | Cooldown between a ship's shots, in ms. Each ship has its own cooldown, so they don't fire in lockstep. |
+| Enemy ships attack each other | When on, ships treat each other as targets as well as players and go for whichever is nearest — so it adds a target rather than distracting them from players. Off by default. |
 | Max black holes | Cap on black holes alive at once. `0` stops new ones; existing ones still live out their duration. |
 | Black hole spawn period | Delay between black hole spawns, in seconds. |
 
 Values are clamped on both sides (`npcSettings.sanitized` here,
 `NpcSettingsData.Sanitized` in ships-go): a zero fire rate would fire every
 tick, and a zero spawn period would spawn a black hole every tick. The
-defaults (1 ship, 10 life, speed 20, 500 ms fire rate, 2 black holes, 30 s
-spawn period) are duplicated in both services and **must be kept in agreement**,
+defaults (1 ship, 10 life, speed 20, 500 ms fire rate, no infighting,
+2 black holes, 30 s spawn period) are duplicated in both services and **must be kept in agreement**,
 since they're what runs before an admin ever opens the panel.
 
 ## Env vars
@@ -99,6 +109,15 @@ Run this alongside `ships-go` (same host, so the localhost check passes).
   by it, announced the same way but with no killer, so nobody is credited).
   See constants at the top of `npc.go` for all tunable values (speed
   factors, shoot range/cooldown, health, respawn delay, fear radius).
+
+  It aims at the **middle** of its target, not at the top-left anchor that
+  travels on the wire. A player's ship geometry comes from the `width`,
+  `height` and `scale` their client sends: `GET /game/getShips` lists only
+  the *public* ships, so a player flying one of their own painting projects
+  cannot be looked up there at all, and guessing produced aim errors of
+  hundreds of pixels. `scale` doesn't move a ship's center (the client
+  compensates with `xTranslation`) but it is the drawn size, so it is what
+  sizes the aim tolerance.
   Its speed model is **derived from ships-vue's `SPEED` constants**, not
   invented: it cruises at a fraction (`enemyShipSpeedFactor`) of a player's
   top speed using a player's acceleration, rescaled from the client's 30fps
@@ -118,3 +137,21 @@ frontend (`ships-vue`) already dispatches NPC behavior by `type`. Destructible
 NPCs additionally need: frontend collision detection sending the `npcHit`
 event (see `checkEnemyShipBulletCollision` in `ships-vue`'s `game.js`), and a
 handler in `ships-npc` for that event (see `handleNpcHit` in `npc.go`).
+
+## Who resolves which hit
+
+Damage is deliberately resolved by whoever can actually see it, and there is
+one case only this service can:
+
+| Shooter → target | Resolved by |
+| --- | --- |
+| Player → NPC | The shooting player's client, which is the only thing tracking that bullet. It sends `npcHit`; ships-go relays it here (`handleNpcHit`). |
+| NPC → player | The victim's own client, exactly as for a player's bullet (`checkEnemyShipBulletCollision`). |
+| NPC → NPC | **Here.** No browser tracks it, so this service flies its own bullets (`activeBullets` keeps each one's trajectory) and resolves the hits in `advanceBullets`. Only active while `enemyShipsFightEachOther` is on. |
+
+Because `NPC_TICK_INTERVAL_MS` is configurable, a bullet can cross more than
+a ship's width in a single step, so hit detection sweeps the segment the
+bullet covered during the tick rather than testing where it ended up. A ship
+is exempt from its own bullets (they start inside its hull) and stops
+avoiding the rival it is hunting, or the two just orbit each other and never
+line up a shot.

@@ -9,7 +9,15 @@ type PlayerData struct {
 	ShipId   string  `json:"shipId"`
 	X        float32 `json:"x"`
 	Y        float32 `json:"y"`
-	IsDead   bool    `json:"isDead"`
+	// Width/Height are the player's raw, unscaled ship size and Scale the
+	// factor it is drawn at (it grows with kills). Together they describe
+	// the ship exactly, without having to resolve ShipId against the public
+	// ship list - which cannot describe a player's own painting project at
+	// all. See playerCenter/playerRadius.
+	Width  float32 `json:"width"`
+	Height float32 `json:"height"`
+	Scale  float32 `json:"scale"`
+	IsDead bool    `json:"isDead"`
 }
 
 // NpcData is the wire-compatible twin of ships-go's
@@ -27,11 +35,20 @@ type NpcData struct {
 	Duration  int     `json:"duration"`
 	Speed     float64 `json:"speed"`
 	// Ship NPC fields (Type == NpcTypes.Ship).
-	ShipId  string  `json:"shipId,omitempty"`
-	Name    string  `json:"name,omitempty"`
-	Rotate  float32 `json:"rotate,omitempty"`
+	ShipId string `json:"shipId,omitempty"`
+	Name   string `json:"name,omitempty"`
+	// Rotate is NOT omitempty: 0 is a legal heading (due east) and is
+	// exactly what a ship spawns with, so omitting it left ships-vue's
+	// update path assigning `undefined` and NaN-ing the ship out of
+	// existence. Must stay in step with ships-go's twin model.
+	Rotate  float32 `json:"rotate"`
 	Life    float32 `json:"life,omitempty"`
 	MaxLife float32 `json:"maxLife,omitempty"`
+	// Kills/Deaths are carried so ships-vue can list NPC ships in the
+	// scoreboard next to the players. They survive a ship's death because
+	// a killed ship comes back with the same identity (see retireEnemyShip).
+	Kills  int `json:"kills"`
+	Deaths int `json:"deaths"`
 }
 
 // NpcTypes mirrors ships-go's NpcTypes enum-like value.
@@ -66,6 +83,16 @@ type gameBroadcast struct {
 	EventName       string                `json:"eventName"`
 	Players         map[string]PlayerData `json:"players"`
 	ActivePlayerIds []string              `json:"activePlayerIds"`
+	Kills           []killEventData       `json:"kills"`
+}
+
+// killEventData is the part of ships-go's relayed playerDied events this
+// service needs: who shot (From) and who died (PlayerId). It's how an NPC
+// finds out it killed somebody - the hit itself is detected by the victim's
+// own client, never here.
+type killEventData struct {
+	From     string `json:"from"`
+	PlayerId string `json:"playerId"`
 }
 
 // npcConfigMsg carries the NPC settings an administrator chose in
@@ -138,6 +165,7 @@ type playerDiedMsg struct {
 // unscaled width/height - see CHANGES.md).
 type publicShip struct {
 	Id     string `json:"_id"`
+	UserId string `json:"userId"`
 	Name   string `json:"name"`
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
@@ -145,6 +173,20 @@ type publicShip struct {
 		Width  int `json:"width"`
 		Height int `json:"height"`
 	} `json:"canvas"`
+}
+
+// size returns the ship's raw width/height, falling back to its canvas
+// size exactly like ships-vue's Player constructor does.
+func (s publicShip) size() (float64, float64) {
+	width := s.Width
+	if width == 0 {
+		width = s.Canvas.Width
+	}
+	height := s.Height
+	if height == 0 {
+		height = s.Canvas.Height
+	}
+	return float64(width), float64(height)
 }
 
 // centerOffset returns the ship's half-width/half-height, falling back to
@@ -156,13 +198,6 @@ type publicShip struct {
 // = (width - realWidth)/2, so the true center is always x + width/2
 // regardless of scale - exactly what Player.getCenteredPosition() returns.
 func (s publicShip) centerOffset() (float64, float64) {
-	width := s.Width
-	if width == 0 {
-		width = s.Canvas.Width
-	}
-	height := s.Height
-	if height == 0 {
-		height = s.Canvas.Height
-	}
-	return float64(width) / 2, float64(height) / 2
+	width, height := s.size()
+	return width / 2, height / 2
 }

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,4 +71,60 @@ func TestAppliesNpcConfigFromShipsGo(t *testing.T) {
 	if wantSpeed := 42 * sim.frameScale; sim.maxSpeed != wantSpeed {
 		t.Fatalf("speed envelope not recomputed: got %v want %v", sim.maxSpeed, wantSpeed)
 	}
+}
+
+// TestConcurrentSendsAreSerialized reproduces the real production layout:
+// the tick loop sends npcUpdate on the main goroutine while this client's
+// read goroutine answers an incoming npcHit with removeBullet/playerDied.
+// gorilla/websocket allows only one writer per connection, so without
+// npcClient serializing them the two interleave into a corrupt frame (and
+// the race detector flags it).
+func TestConcurrentSendsAreSerialized(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := newNpcClient("ws"+strings.TrimPrefix(server.URL, "http"), "secret", false, newPlayerTracker())
+	go client.run()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client.mu.Lock()
+		ready := client.conn != nil
+		client.mu.Unlock()
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client never connected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if g%2 == 0 {
+					_ = client.sendUpdate([]NpcData{{Id: "npc", X: float64(i)}})
+				} else {
+					_ = client.sendRemoveBullet("bullet")
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }

@@ -33,6 +33,16 @@ type npcSettings struct {
 	MaxBlackHoles int `json:"maxBlackHoles"`
 	// BlackHoleSpawnPeriodSec is the delay between black hole spawns.
 	BlackHoleSpawnPeriodSec int `json:"blackHoleSpawnPeriodSec"`
+	// EnemyShipsFightEachOther makes enemy ships treat each other as valid
+	// targets, not just players: they pick whichever is nearest, and their
+	// bullets damage each other.
+	//
+	// Player-vs-NPC damage is reported by the shooting player's own client
+	// (an npcHit event), because only that client knows where its bullet
+	// is. Nobody's client tracks NPC-vs-NPC, so this service resolves those
+	// hits itself - which is why it has to keep flying its own bullets (see
+	// activeBullets) instead of only timing them out.
+	EnemyShipsFightEachOther bool `json:"enemyShipsFightEachOther"`
 }
 
 // defaultNpcSettings are the values this service uses until ships-go tells
@@ -46,6 +56,8 @@ func defaultNpcSettings() npcSettings {
 		EnemyShipFireRateMs:     500,
 		MaxBlackHoles:           2,
 		BlackHoleSpawnPeriodSec: 30,
+		// Off by default; mirrors the ships-go side.
+		EnemyShipsFightEachOther: false,
 	}
 }
 

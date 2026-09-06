@@ -1,5 +1,131 @@
 CHANGES
 =======
+Version 0.7.2 - 2026-09-06
+------------------
+- Bugfix: NPC ships aimed hundreds of pixels away from players flying a ship
+  of their own making, so they turned towards a point beside their target and
+  shot past it. A player's position on the wire is their ship's top-left
+  anchor, and the middle was worked out from the ship's size looked up by
+  shipId - but GET /game/getShips lists only the *public* ships, so a
+  player's own painting project could not be measured at all. A live 1000x1000
+  custom ship was being aimed at as if it were the 100x100 fallback: the aim
+  point was ~600px out, and the aim tolerance (the half-angle the target
+  subtends, which decides when it is worth firing) was several times too
+  generous, so shots were loosed while still pointing well past the player.
+- The client now sends its ship's real width/height, so the geometry is known
+  exactly instead of guessed: no lookup, and correct for any custom ship. The
+  ship-list lookup remains as a fallback. Scale is honoured too - it does not
+  move a ship's center, but it is the drawn size, which is what the victim's
+  own client resolves our hits against.
+
+Version 0.7.1 - 2026-09-06
+------------------
+- Bugfix: NPC ships aimed at the wrong point, and so turned the wrong way,
+  against any player flying a ship of their own making. Target positions
+  arrive as the ship's top-left anchor and are converted to a center using
+  the ship's size, looked up in GET /game/getShips - but that endpoint only
+  lists the *public* ships, so a player's own painting project isn't there.
+  The lookup miss fell back to a zero offset, i.e. aiming at the corner:
+  measured at 26-35 degrees of steady aiming error, enough that the ship
+  chased and shot past its target indefinitely. It now resolves an unknown
+  shipId to the same fallback ship ships-vue draws that player with, so the
+  NPC aims at the ship everyone can actually see.
+
+Version 0.7.0 - 2026-09-06
+------------------
+- Enemy ships can now fight each other, controlled by a new toggle in the
+  admin panel (off by default). They pick whichever is nearest - a player or
+  a rival ship - so it adds a target rather than distracting them from
+  players, and a kill reads in the feed like any other, naming the ship that
+  scored it.
+- To make that possible this service now flies its own bullets rather than
+  only timing them out. Every other damage path is reported by a browser -
+  a player's client tells us when its bullet hit one of our ships, and the
+  victim's client handles our bullets hitting a player - but nobody is
+  watching NPC against NPC, so those hits are resolved here. Hit detection
+  sweeps the whole path a bullet covered during the tick instead of testing
+  where it ended up: NPC_TICK_INTERVAL_MS is configurable and a bullet can
+  easily cross more than a ship's width in one step.
+- A ship never shoots itself (its bullets start inside its own hull) and
+  stops avoiding the rival it is currently hunting, since the separation
+  distance is wider than the range it wants to fight from - without that,
+  two rivals just orbit each other and never line up a shot.
+- Bugfix: a pile of ships could be left a few pixels overlapped. Separation
+  resolves one pair at a time, so with more than two ships a single pass can
+  push one straight back into a pair it had already separated. It now
+  repeats until nothing moves. Reproduced in about 2% of runs before, none
+  after.
+
+Version 0.6.1 - 2026-09-06
+------------------
+- Bugfix: two goroutines wrote to the websocket at the same time. The tick
+  loop sends the NPC snapshot while the reading goroutine sends bullet
+  removals and player deaths, and a websocket allows exactly one writer -
+  concurrent writes interleave into a corrupt frame that ships-go cannot
+  decode. Writes are now serialised, carry a ten second deadline (a blocking
+  write would freeze every NPC, because sends happen while the simulator is
+  locked), and a failed write closes the connection so the usual reconnect
+  runs.
+- Bugfix: a newly spawned enemy ship was invisible and impossible to hit
+  until it happened to turn. Its heading was exactly zero at spawn and the
+  field was omitted from the wire when zero, so the browser had nothing to
+  assign and poisoned the ship's position with NaN. The heading is now always
+  sent, and ships spawn pointing in a random direction.
+
+Version 0.6.0 - 2026-09-05
+------------------
+- Enemy ships keep their identity when they die. A destroyed ship used to be
+  replaced by a brand new one with a fresh uuid, a random hull and a random
+  name, so no NPC ever built up a record. A killed (or despawned) ship is now
+  retired and the next respawn revives it with the same id, name and hull,
+  resetting only what a new life resets: position, heading, throttle and
+  health. This is what makes NPCs worth listing in ships-vue's scoreboard,
+  and it reads like a recurring rival instead of an endless parade of
+  strangers.
+- Enemy ships now carry `kills`/`deaths` on the wire. Deaths are counted
+  here; kills are learned from the `kills` list in ships-go's gameBroadcast,
+  because the hit is always detected by the victim's own client and never by
+  this service. A kill event whose victim is one of our own ships is ignored,
+  so a ship is never credited for its own death.
+- ships-go now refuses a second NPC controller. When that happens this
+  service logs why (almost always: a previous ships-npc is still running)
+  instead of silently retrying.
+- The reconnect backoff resets after a connection that lasted a while, so one
+  early hiccup no longer leaves ships-go without NPCs for 30s after every
+  later drop.
+
+Version 0.5.0 - 2026-09-05
+------------------
+- Enemy ships are now *flown* like a player flies one instead of being
+  steered like a cursor. Previously a ship snapped its heading straight to
+  the bearing of its target and moved along that bearing, so it pivoted and
+  changed direction instantly - obviously non-human. Now it picks the
+  heading it wants, turns towards it at the same fixed rate a player gets
+  from holding left/right (ships-vue's `SPEED.ROTATION`, taking the short
+  way round), and always moves along the direction it is actually facing.
+  Combined with the existing progressive acceleration/braking, a ship now
+  banks into turns and overshoots like a real ship.
+- Guns fire along the ship's nose, like a player's fixed forward guns,
+  instead of along the bearing to the target - which used to send bullets
+  out at a visible angle to the ship whenever it hadn't finished turning.
+  A ship now holds fire until it's genuinely lined up; the tolerance is
+  derived per shot from how wide the target looks at its current distance,
+  so close targets are easy and distant ones demand a tighter line-up.
+- Enemy ships now collide with **each other**. Ship-vs-ship collision is
+  resolved client-side in ships-vue, but a client can only ever move its
+  own player, so nothing was resolving NPC-against-NPC overlap and a fleet
+  hunting the same player collapsed into a single pile. This service owns
+  every ship, so it resolves them here, mirroring the client's axis-of-
+  least-penetration push and moving each ship half the overlap so the
+  result is symmetric.
+- Ships also *steer* away from crowding, not just un-overlap after the
+  fact: without that they converge on the same point and grind against
+  each other permanently, with collision only ever undoing the last step.
+  A group now fans out into a loose formation and attacks from several
+  angles.
+- With nobody left to chase, ships coast to a stop instead of holding
+  their last speed forever.
+
 Version 0.4.1 - 2026-09-05
 ------------------
 - Enemy ship speed is now expressed in the game's own speed units (the same

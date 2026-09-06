@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -26,10 +27,27 @@ type npcClient struct {
 	// admin changed the NPC settings, or this connection just authenticated
 	// and is being told the values currently in force. Set before run().
 	onSettings func(npcSettings)
+	// onKills is called with the kill events ships-go relays, so an NPC can
+	// be credited for the players it shot down. The hit itself is always
+	// detected by the victim's client, never here.
+	onKills func([]killEventData)
 
 	mu   sync.Mutex
 	conn *websocket.Conn
+
+	// writeMu serializes writes. gorilla/websocket supports exactly one
+	// concurrent writer per connection, and sends genuinely come from two
+	// goroutines: the tick loop (npcUpdate, bullets, expiries) and this
+	// client's own read goroutine, where an incoming npcHit is answered
+	// with removeBullet/playerDied. The simulator's lock does not cover
+	// this - sendUpdate is called after tick() has already released it.
+	writeMu sync.Mutex
 }
+
+// writeTimeout bounds a single frame write. Sends are made while the
+// simulator holds its lock, so a write that blocked forever would freeze
+// every NPC with it rather than just delaying one message.
+const writeTimeout = 10 * time.Second
 
 func newNpcClient(url, secret string, insecureTLS bool, players *playerTracker) *npcClient {
 	return &npcClient{url: url, secret: secret, insecureTLS: insecureTLS, players: players}
@@ -42,8 +60,15 @@ func (c *npcClient) run() {
 	const maxBackoff = 30 * time.Second
 
 	for {
+		connectedAt := time.Now()
 		if err := c.connectAndRead(); err != nil {
 			log.Println("ships-npc: connection error:", err)
+		}
+		// A connection that lasted a while was healthy, so don't carry the
+		// previous failure's backoff into it: otherwise a single early
+		// hiccup leaves ships-go without NPCs for 30s after every drop.
+		if time.Since(connectedAt) > maxBackoff {
+			backoff = time.Second
 		}
 		log.Printf("ships-npc: reconnecting in %s\n", backoff)
 		time.Sleep(backoff)
@@ -103,6 +128,9 @@ func (c *npcClient) connectAndRead() error {
 				continue
 			}
 			c.players.apply(msg)
+			if c.onKills != nil {
+				c.onKills(msg.Kills)
+			}
 		case "npcConfig":
 			var cfg npcConfigMsg
 			if err := json.Unmarshal(raw, &cfg); err != nil {
@@ -121,6 +149,17 @@ func (c *npcClient) connectAndRead() error {
 			if c.onNpcHit != nil {
 				c.onNpcHit(hit)
 			}
+		case "npcRejected":
+			// ships-go only lets one controller drive the NPCs, because two
+			// of them overwrite each other's snapshot every tick and make
+			// the NPCs flicker for players. Almost always this means a
+			// previous ships-npc is still running.
+			var msg struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.Unmarshal(raw, &msg)
+			return fmt.Errorf("ships-go refused this NPC controller: %s "+
+				"(is another ships-npc still running?)", msg.Reason)
 		}
 	}
 }
@@ -160,5 +199,18 @@ func (c *npcClient) sendEnvelope(event any) error {
 	if conn == nil {
 		return nil
 	}
-	return conn.WriteJSON([]any{event})
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err := conn.WriteJSON([]any{event})
+	if err != nil {
+		// Any write error on a websocket leaves the connection unusable,
+		// and a timeout leaves it permanently broken for writes while the
+		// read side happily blocks on. Closing it makes the reader return
+		// so run() reconnects instead of running blind.
+		_ = conn.Close()
+	}
+	return err
 }

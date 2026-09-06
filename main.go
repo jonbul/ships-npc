@@ -37,6 +37,7 @@ func main() {
 	client := newNpcClient(wsURL, secret, insecureTLS, players)
 	simulator := newNpcSimulator(client, ships, tickInterval)
 	client.onNpcHit = simulator.handleNpcHit
+	client.onKills = simulator.recordKills
 	client.onSettings = func(settings npcSettings) {
 		simulator.applySettings(settings)
 		log.Printf("ships-npc: applied NPC settings from admin: %+v\n", simulator.currentSettings())
