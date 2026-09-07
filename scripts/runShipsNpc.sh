@@ -3,7 +3,7 @@ set -x # show commands in execution
 
 CONTAINER_NAME="ships-npc"
 IMAGE_NAME="ships-npc-image"
-ROOT_PATH="/home/jonbul/servers"
+ROOT_PATH="/home/jonbul/servers/ships"
 PROJECT_PATH="$ROOT_PATH/ships-npc"
 ENV_PATH="$ROOT_PATH/files/.env"
 
@@ -66,7 +66,7 @@ echo "=== ARRANCAR CONTENEDOR ==="
 # (wss://localhost:3000/ws NO funcionará entre contenedores distintos).
 docker run -d \
     --name $CONTAINER_NAME \
-    --network ships-network \
+    --network container:ships-go \
     -v "$ENV_PATH:/app/.env:ro" \
     $IMAGE_NAME:latest
 
