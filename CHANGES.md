@@ -180,6 +180,25 @@ describes what the service does rather than how it got there.
   units, where `50` is a player at full throttle. Defaults: 1 enemy ship, 10
   life, speed 20, 500 ms fire rate, 2 black holes, 30 s spawn period - slower
   than a player by design, but shooting far more often.
+- **Reports its own CPU and memory**, so the most computationally expensive
+  part of the game is no longer the only part with no monitoring. A sample
+  goes up the websocket every few seconds as an `npcMetrics` event and
+  ships-go re-exports it on the `/metrics` endpoint Prometheus already
+  scrapes, which is what puts it on the existing Grafana dashboard without
+  this service needing an HTTP server, a port or a scrape target of its own -
+  it is a client on loopback, so nothing could reach it to scrape it anyway.
+  Standard library only: CPU from `getrusage`, resident size from
+  `/proc/self/statm`, heap and goroutines from `runtime`.
+
+  Alongside the raw usage it reports how many NPCs it was simulating and how
+  long an average tick took, because those are what make a CPU number mean
+  anything here: the question worth asking is how many ships can be flown
+  before a tick stops fitting inside `NPC_TICK_INTERVAL_MS`. Reported on its
+  own clock rather than from the tick loop, which skips its body entirely
+  when no players are connected - "what is this doing while the game is
+  empty?" is a question the dashboard should still answer.
+- New `NPC_METRICS_INTERVAL_MS` env var (default 5000) for how often that
+  sample is sent.
 - New `NPC_API_URL` env var, defaulting to a URL derived from `NPC_WS_URL`.
 - Test suite covering the black hole pull's parity with ships-vue, gravity
   range and escape, aiming from every direction (including ships-vue's

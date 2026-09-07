@@ -81,6 +81,23 @@ since they're what runs before an admin ever opens the panel.
 - `NPC_TLS_INSECURE_SKIP_VERIFY` (default `true`): skip TLS verification,
   useful for ships-go's local self-signed dev certificate.
 - `NPC_TICK_INTERVAL_MS` (default `100`): simulation tick interval.
+- `NPC_METRICS_INTERVAL_MS` (default `5000`): how often this service reports
+  its own CPU and memory to ships-go (see Metrics below).
+
+## Metrics
+
+This service has no HTTP endpoint of its own: it is a websocket client on
+loopback, so nothing could reach it to scrape it. Instead it samples its own
+resource usage and pushes it to ships-go as an `npcMetrics` event, and
+ships-go re-exports it on the `/metrics` endpoint Prometheus already scrapes,
+as `ships_npc_cpu_seconds_total` (counter), `ships_npc_cpu_percent`,
+`ships_npc_memory_resident_bytes`, `ships_npc_memory_heap_bytes`,
+`ships_npc_memory_heap_sys_bytes`, `ships_npc_goroutines`,
+`ships_npc_simulated_npcs`, `ships_npc_tick_seconds` and `ships_npc_up`.
+
+`ships_npc_simulated_npcs` and `ships_npc_tick_seconds` are the pair to watch
+when sizing fleets: a tick average approaching `NPC_TICK_INTERVAL_MS` is a
+simulation about to fall behind, whatever the CPU percentage says.
 
 ## Run
 

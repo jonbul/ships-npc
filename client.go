@@ -177,6 +177,24 @@ func (c *npcClient) sendUpdate(npcs []NpcData) error {
 	return c.sendEnvelope(npcUpdateMsg{EventName: "npcUpdate", Npcs: npcs})
 }
 
+// sendMetrics reports this process's resource usage so ships-go can put it
+// on /metrics. Sent on its own slow ticker rather than with the per-tick
+// npcUpdate: this changes on the scale of seconds, and a Grafana dashboard
+// does not need it ten times a second.
+func (c *npcClient) sendMetrics(m processMetrics) error {
+	return c.sendEnvelope(npcMetricsMsg{
+		EventName:     "npcMetrics",
+		CpuSeconds:    m.CPUSeconds,
+		CpuPercent:    m.CPUPercent,
+		ResidentBytes: m.ResidentBytes,
+		HeapBytes:     m.HeapBytes,
+		HeapSysBytes:  m.HeapSysBytes,
+		Goroutines:    m.Goroutines,
+		Npcs:          m.Npcs,
+		TickSeconds:   m.TickSeconds,
+	})
+}
+
 // sendBullet broadcasts a new Ship NPC-fired bullet to every client, using
 // the exact same event ships-go/ships-vue already use for player-fired
 // bullets - no frontend changes needed to render/animate it.

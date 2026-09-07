@@ -76,6 +76,24 @@ type npcUpdateMsg struct {
 	Npcs      []NpcData `json:"npcs"`
 }
 
+// npcMetricsMsg reports this process's own resource usage to ships-go,
+// which re-exports it on its already-scraped /metrics endpoint. See
+// metrics.go for what the numbers mean and why they travel this way.
+//
+// Field names match the ships-go struct exactly: the two are hand-mirrored
+// twins, like npcSettings, so they have to be changed together.
+type npcMetricsMsg struct {
+	EventName     string  `json:"eventName"`
+	CpuSeconds    float64 `json:"cpuSeconds"`
+	CpuPercent    float64 `json:"cpuPercent"`
+	ResidentBytes float64 `json:"residentBytes"`
+	HeapBytes     float64 `json:"heapBytes"`
+	HeapSysBytes  float64 `json:"heapSysBytes"`
+	Goroutines    int     `json:"goroutines"`
+	Npcs          int     `json:"npcs"`
+	TickSeconds   float64 `json:"tickSeconds"`
+}
+
 // gameBroadcast is the (partial) shape of the message ships-go sends to
 // every connected socket, including this NPC controller. Only the fields
 // ships-npc actually needs are declared.

@@ -20,6 +20,9 @@ func main() {
 	}
 	insecureTLS := envBool("NPC_TLS_INSECURE_SKIP_VERIFY", true)
 	tickInterval := envDuration("NPC_TICK_INTERVAL_MS", 100*time.Millisecond)
+	// How often resource usage is reported to ships-go. Scrape-rate work,
+	// not game work, so it is seconds rather than milliseconds.
+	metricsInterval := envDuration("NPC_METRICS_INTERVAL_MS", 5*time.Second)
 
 	// Ships available for the enemy Ship NPC to use, fetched from the same
 	// endpoint the game client uses to populate its own ship picker
@@ -46,15 +49,40 @@ func main() {
 
 	go client.run()
 
+	sampler := newMetricsSampler()
+	go reportMetrics(client, simulator, sampler, metricsInterval)
+
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		if players.count() == 0 {
 			continue
 		}
+		started := time.Now()
 		simulator.tick(players.snapshot())
 		if err := client.sendUpdate(simulator.snapshot()); err != nil {
 			log.Println("ships-npc: failed to send npcUpdate:", err)
+		}
+		// Timed around the send as well as the simulation: a slow write to
+		// ships-go delays the next tick just as surely as slow physics
+		// does, and this number exists to answer "is it keeping up?".
+		sampler.observeTick(time.Since(started))
+	}
+}
+
+// reportMetrics ships a resource sample to ships-go on its own slow clock.
+//
+// Deliberately not part of the tick loop: that loop skips its body entirely
+// while no players are connected, and "what is this process doing when the
+// game is empty?" is a question the dashboard should still be able to
+// answer. Failures are logged and the loop continues - a dashboard is never
+// worth taking the service down for.
+func reportMetrics(client *npcClient, simulator *npcSimulator, sampler *metricsSampler, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		if err := client.sendMetrics(sampler.sample(simulator.npcCount(), now)); err != nil {
+			log.Println("ships-npc: failed to send npcMetrics:", err)
 		}
 	}
 }

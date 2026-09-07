@@ -563,6 +563,15 @@ func (s *npcSimulator) tick(players map[string]PlayerData) {
 
 // snapshot returns the full current NPC batch, ready to be sent to
 // ships-go in a single npcUpdate message.
+// npcCount is how many NPCs are alive right now, for the metrics sample.
+// Separate from snapshot() so reporting does not allocate a copy of the
+// whole fleet every time it runs.
+func (s *npcSimulator) npcCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.npcs) + len(s.enemyShips)
+}
+
 func (s *npcSimulator) snapshot() []NpcData {
 	s.mu.Lock()
 	defer s.mu.Unlock()
